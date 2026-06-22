@@ -7,9 +7,11 @@ Fill or update the embedded images in an existing plan `.html` file. Pick the su
 | Create | The prompt asks to generate, fill, or add the plan's images from scratch (empty `{{...IMAGE` slots) |
 | Update | The prompt asks to change, refine, regenerate, or replace images that already exist in the plan |
 
-Scripts (run with `uv run`, needs `OPENAI_API_KEY`):
-- Create image: `uv run scripts/generate_gpt_image.py "<prompt>" <output.png> --size 1536x1024 --quality high`
-- Edit image: `uv run scripts/edit_gpt_image.py "<instruction>" <output.png> <input.png> --size 1536x1024 --quality high`
+Scripts (run with `uv run`). They default to the **gemini** provider (`gemini-3.1-flash`, needs `GEMINI_API_KEY`); pass `--provider openai` to use gpt-image-2 instead (needs `OPENAI_API_KEY`). The `--quality`/`--background`/`--format` flags are openai-only; for gemini the `--size` WxH is snapped to the nearest supported aspect ratio.
+- Create image (gemini default): `uv run scripts/generate_gpt_image.py "<prompt>" <output.png> --size 1536x1024`
+- Edit image (gemini default): `uv run scripts/edit_gpt_image.py "<instruction>" <output.png> <input.png>`
+- Create image (openai): `uv run scripts/generate_gpt_image.py "<prompt>" <output.png> --provider openai --size 1536x1024 --quality high`
+- Edit image (openai): `uv run scripts/edit_gpt_image.py "<instruction>" <output.png> <input.png> --provider openai --size 1536x1024 --quality high`
 
 Shared rules for every image prompt:
 - always generate in wide format (`--size 1536x1024`) at high quality (`--quality high`)

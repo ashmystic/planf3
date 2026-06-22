@@ -7,40 +7,59 @@
 # ]
 # ///
 """
-Edit existing images using OpenAI's gpt-image-2 (ChatGPT Images 2.0).
+Edit/compose existing images with Google Gemini (default) or OpenAI's gpt-image-2.
 
-Pass one or more input images. With multiple inputs, gpt-image-2 composes them.
+Provider is selected with --provider (default: gemini). Gemini talks to the raw
+generateContent REST endpoint (no extra deps); OpenAI uses the openai SDK.
+Pass one or more input images. With multiple inputs the model composes them.
 
 Usage:
-    python edit_gpt_image.py input.png "edit instruction" output.png [options]
-    python edit_gpt_image.py "Put cat on couch" result.png cat.png couch.png [options]
+    python edit_gpt_image.py "edit instruction" output.png input.png [more.png ...] [options]
 
 Examples:
-    python edit_gpt_image.py photo.png "Add a rainbow in the sky" edited.png
+    python edit_gpt_image.py "Add a rainbow in the sky" edited.png photo.png
     python edit_gpt_image.py "Make a group photo" group.png p1.png p2.png p3.png
+    python edit_gpt_image.py "Add a rainbow" edited.png photo.png --provider openai
 
 Environment:
-    OPENAI_API_KEY - Required API key
+    GEMINI_API_KEY - Required when --provider gemini (default)
+    OPENAI_API_KEY - Required when --provider openai
 """
 
 import argparse
 import base64
+import json
 import os
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
 load_dotenv(Path.cwd() / ".env")
 
+
+VALID_PROVIDERS = ["gemini", "openai"]
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash"
+DEFAULT_OPENAI_MODEL = "gpt-image-2"
 
 VALID_QUALITY = ["auto", "low", "medium", "high"]
 VALID_FORMATS = ["png", "jpeg", "webp"]
 # gpt-image-2 does NOT support "transparent" — only opaque/auto.
 VALID_BACKGROUND = ["auto", "opaque"]
+
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+
+MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def backup_if_exists(output_path: str) -> None:
@@ -68,11 +87,83 @@ def backup_if_exists(output_path: str) -> None:
     print(f"Backed up existing {output_path} -> {dest}")
 
 
+def mime_for(path: str) -> str:
+    return MIME_BY_SUFFIX.get(Path(path).suffix.lower(), "image/png")
+
+
+def gemini_generate_content(api_key: str, model: str, parts: list[dict]):
+    """POST to the Gemini generateContent REST endpoint; return (b64_data, mime_type)."""
+    url = f"{GEMINI_ENDPOINT}/{model}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"responseModalities": ["IMAGE"]},
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        hint = " (check --model is an image-capable Gemini model)" if e.code in (400, 404) else ""
+        raise RuntimeError(f"Gemini HTTP {e.code}: {detail[:300]}{hint}")
+
+    candidates = payload.get("candidates", [])
+    for cand in candidates:
+        for part in cand.get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
+                return inline["data"], mime
+    finish = candidates[0].get("finishReason", "?") if candidates else "no candidates"
+    raise RuntimeError(f"Gemini returned no image (finishReason={finish})")
+
+
+def edit_gemini_image(
+    input_paths: list[str],
+    instruction: str,
+    output_path: str,
+    model: str,
+) -> None:
+    """Edit/compose images using a Gemini image model via REST."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("GEMINI_API_KEY environment variable not set")
+
+    for p in input_paths:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Input image not found: {p}")
+
+    # Input images first, then the text instruction (mirrors Gemini's image-edit examples).
+    parts: list[dict] = []
+    for p in input_paths:
+        data = base64.b64encode(Path(p).read_bytes()).decode("ascii")
+        parts.append({"inline_data": {"mime_type": mime_for(p), "data": data}})
+    parts.append({"text": instruction})
+
+    print("Provider:   gemini")
+    print(f"Model:      {model}")
+    print(f"Inputs:     {', '.join(input_paths)}")
+    print(f"Prompt:     {instruction[:120]}{'...' if len(instruction) > 120 else ''}")
+    print()
+    print("Editing image...")
+
+    b64_data, _mime = gemini_generate_content(api_key, model, parts)
+    backup_if_exists(output_path)
+    Path(output_path).write_bytes(base64.b64decode(b64_data))
+    print(f"Saved: {output_path}")
+
+
 def edit_gpt_image(
     input_paths: list[str],
     instruction: str,
     output_path: str,
-    model: str = "gpt-image-2",
+    model: str = DEFAULT_OPENAI_MODEL,
     size: str = "auto",
     quality: str = "auto",
     output_format: str = "png",
@@ -81,6 +172,8 @@ def edit_gpt_image(
     background: str = "auto",
 ) -> None:
     """Edit/compose images using gpt-image-2."""
+    from openai import OpenAI
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise EnvironmentError("OPENAI_API_KEY environment variable not set")
@@ -109,6 +202,7 @@ def edit_gpt_image(
                 raise FileNotFoundError(f"Mask not found: {mask_path}")
             kwargs["mask"] = open(mask_path, "rb")
 
+        print("Provider:   openai")
         print(f"Model:      {model}")
         print(f"Inputs:     {', '.join(input_paths)}")
         print(f"Size:       {size}")
@@ -137,7 +231,7 @@ def edit_gpt_image(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Edit/compose images using OpenAI gpt-image-2",
+        description="Edit/compose images with Gemini (default) or OpenAI gpt-image-2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -149,48 +243,58 @@ def main():
         help="One or more input image paths (multiple = composition)",
     )
     parser.add_argument(
+        "--provider",
+        "-p",
+        default="gemini",
+        choices=VALID_PROVIDERS,
+        help="Image provider (default: gemini)",
+    )
+    parser.add_argument(
         "--model",
         "-m",
-        default="gpt-image-2",
-        help="Model ID (default: gpt-image-2)",
+        default=None,
+        help=(
+            "Model ID. Defaults per provider: "
+            f"'{DEFAULT_GEMINI_MODEL}' (gemini), '{DEFAULT_OPENAI_MODEL}' (openai)."
+        ),
     )
     parser.add_argument(
         "--size",
         "-s",
         default="auto",
-        help="Image size WxH (default: auto). E.g. 1024x1024, 1536x1024, 2048x2048.",
+        help="Image size WxH (openai only; default: auto). E.g. 1024x1024, 1536x1024.",
     )
     parser.add_argument(
         "--quality",
         "-q",
         default="auto",
         choices=VALID_QUALITY,
-        help="Quality tier (default: auto)",
+        help="Quality tier (openai only; default: auto)",
     )
     parser.add_argument(
         "--format",
         "-f",
         default="png",
         choices=VALID_FORMATS,
-        help="Output format (default: png)",
+        help="Output format (openai only; default: png)",
     )
     parser.add_argument(
         "--compression",
         type=int,
         default=None,
-        help="Output compression 0-100 (jpeg/webp only)",
+        help="Output compression 0-100 (openai jpeg/webp only)",
     )
     parser.add_argument(
         "--mask",
         default=None,
-        help="Optional mask PNG (transparent areas = regions to edit)",
+        help="Optional mask PNG (openai only; transparent areas = regions to edit)",
     )
     parser.add_argument(
         "--background",
         default="auto",
         choices=VALID_BACKGROUND,
         help=(
-            "Background mode (default: auto). gpt-image-2 supports only "
+            "Background mode (openai only; default: auto). gpt-image-2 supports only "
             "'auto' or 'opaque' — 'transparent' is NOT supported by this model."
         ),
     )
@@ -198,18 +302,26 @@ def main():
     args = parser.parse_args()
 
     try:
-        edit_gpt_image(
-            input_paths=args.inputs,
-            instruction=args.instruction,
-            output_path=args.output,
-            model=args.model,
-            size=args.size,
-            quality=args.quality,
-            output_format=args.format,
-            output_compression=args.compression,
-            mask_path=args.mask,
-            background=args.background,
-        )
+        if args.provider == "gemini":
+            edit_gemini_image(
+                input_paths=args.inputs,
+                instruction=args.instruction,
+                output_path=args.output,
+                model=args.model or DEFAULT_GEMINI_MODEL,
+            )
+        else:
+            edit_gpt_image(
+                input_paths=args.inputs,
+                instruction=args.instruction,
+                output_path=args.output,
+                model=args.model or DEFAULT_OPENAI_MODEL,
+                size=args.size,
+                quality=args.quality,
+                output_format=args.format,
+                output_compression=args.compression,
+                mask_path=args.mask,
+                background=args.background,
+            )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
